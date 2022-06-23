@@ -1,0 +1,160 @@
+version: 2.1
+
+orbs:
+  aws-cli: circleci/aws-cli@2.0.6
+  serverless: circleci/serverless-framework@1.0.1
+  github-cli: circleci/github-cli@1.0.5
+
+aliases:
+  - &fix_docker
+    run:
+      name: Fix docker (local-only)
+      command: |
+        if [[ $CIRCLE_SHELL_ENV == *"localbuild"* ]]; then
+          sudo chown $(whoami):$(whoami) /run/docker-temp.sock
+        fi
+
+jobs:
+  main:
+    docker:
+      - image: "cimg/base:stable"
+    steps:
+      - github-cli/setup
+      - github-cli/clone
+      - aws-cli/setup
+      - serverless/setup
+      - setup_remote_docker:
+          version: 19.03.13
+      - <<: *fix_docker
+      - run:
+          command: |
+            echo "TESTED_COMMIT=$(git rev-parse HEAD)" >> /tmp/VERSIONS
+          name: Fetch testing commit hash
+      - run:
+          command: |
+            set -euxo pipefail
+            docker pull public.ecr.aws/lambda/python:latest
+            SHA256_DIGEST=$(docker inspect public.ecr.aws/lambda/python:latest | jq -r '.[0].RepoDigests[0] | split(":") | .[1]' )
+            echo "SHA256_DIGEST=${SHA256_DIGEST}" >> /tmp/VERSIONS
+          name: Fetch latest image digest
+      - run:
+          command: |
+            set -euxo pipefail
+            WHOLE_JSON=$(curl https://omahaproxy.appspot.com/all.json)
+            JSON=$(echo $WHOLE_JSON | jq -r '.[] | select(.os=="linux") | .versions[] | select(.channel=="stable")')
+            POSITION=$(echo $JSON | jq -r '.branch_base_position')
+
+            if (( POSITION < 900000 )); then
+                JSON=$(echo $WHOLE_JSON | jq -r '.[] | select(.os=="linux") | .versions[] | select(.channel=="beta")')
+                POSITION=$(echo $JSON | jq -r '.branch_base_position')
+                echo "CHANNEL=beta" >> /tmp/VERSIONS
+            fi
+
+            MAJOR_VERSION=$(echo $JSON | jq -r '.version | split(".") | .[0]')
+
+            for _ in {1..100}; do
+                DOWNLOAD_URL="https://www.googleapis.com/download/storage/v1/b/chromium-browser-snapshots/o/Linux_x64%2F${POSITION}%2Fchrome-linux.zip?alt=media"
+                curl -I $DOWNLOAD_URL | head -1 | grep -q 404 || break
+                POSITION=$(($POSITION-1))
+                sleep 1
+            done
+
+            echo "POSITION=${POSITION}" >> /tmp/VERSIONS
+            DRIVER_VERSION=$(curl "https://chromedriver.storage.googleapis.com/LATEST_RELEASE_${MAJOR_VERSION}")
+            echo "DRIVER_VERSION=${DRIVER_VERSION}" >> /tmp/VERSIONS
+          name: Fetch latest chromium and chromedriver versions
+      - run:
+          command: |
+            set -euxo pipefail
+            SHA256_DIGEST=$(cat /tmp/VERSIONS | grep SHA256_DIGEST | awk -F "=" '{print $2}')
+            POSITION=$(cat /tmp/VERSIONS | grep POSITION | awk -F "=" '{print $2}')
+            DRIVER_VERSION=$(cat /tmp/VERSIONS | grep DRIVER_VERSION | awk -F "=" '{print $2}')
+            sed -r "s/public.ecr.aws\/lambda\/python[:@a-z0-9]+/public.ecr.aws\/lambda\/python\@sha256\:${SHA256_DIGEST}/g; s/chromedriver.storage.googleapis.com\/[0-9.]+/chromedriver.storage.googleapis.com\/${DRIVER_VERSION}/g; s/Linux_x64%2F[0-9]+%2Fchrome-linux.zip/Linux_x64%2F${POSITION}%2Fchrome-linux.zip/g" -i Dockerfile
+          name: Modify Dockerfile
+      - run:
+          command: sls deploy
+          name: Delpoy
+      - run:
+          command: |
+            CHROME_VERSION=$(docker run --rm --entrypoint '' serverless-docker-selenium-lambda-prod:img /opt/chrome/chrome --version | awk '{print $2}' | sed -e 's/^[[:space:]]*//')
+            echo "CHROME_VERSION=${CHROME_VERSION}" >> /tmp/VERSIONS
+          name: Extract installed chromium version
+      - run:
+          command: |
+            SELENIUM_VERSION=$(docker run --rm --entrypoint '' serverless-docker-selenium-lambda-prod:img pip freeze | grep selenium | awk -F "==" '{print $2}')
+            echo "SELENIUM_VERSION=${SELENIUM_VERSION}" >> /tmp/VERSIONS
+          name: Extract installed selenium version
+      - run:
+          command: |
+            PYTHON_VERSION=$(docker run --rm --entrypoint '' serverless-docker-selenium-lambda-prod:img python -V | awk '{print $2}')
+            echo "PYTHON_VERSION=${PYTHON_VERSION}" >> /tmp/VERSIONS
+          name: Extract installed Python version
+      - store_artifacts:
+          path: /tmp/VERSIONS
+      - run:
+          command: |
+            sls invoke -f demo > /tmp/RESULT
+          name: Invoke
+      - store_artifacts:
+          path: /tmp/RESULT
+      - run:
+          command: cat /tmp/RESULT | grep -q "This domain is for use in illustrative examples in documents"
+          name: Test
+      - run:
+          command: |
+            set -euxo pipefail
+            CHROME_VERSION=$(cat /tmp/VERSIONS | grep CHROME_VERSION | awk -F "=" '{print $2}')
+            DRIVER_VERSION=$(cat /tmp/VERSIONS | grep DRIVER_VERSION | awk -F "=" '{print $2}')
+            SELENIUM_VERSION=$(cat /tmp/VERSIONS | grep SELENIUM_VERSION | awk -F "=" '{print $2}')
+            PYTHON_VERSION=$(cat /tmp/VERSIONS | grep PYTHON_VERSION | awk -F "=" '{print $2}')
+            sed -r "s/- chromium [0-9.]+/- chromium ${CHROME_VERSION}/g; s/- chromedriver [0-9.]+/- chromedriver ${DRIVER_VERSION}/g; s/- selenium [0-9.]+/- selenium ${SELENIUM_VERSION}/g; s/- Python [0-9.]+/- Python ${PYTHON_VERSION}/g" -i README.md
+          name: Modify README.md
+      - run:
+          command: |
+            git --no-pager diff
+            git --no-pager diff --name-only | grep -q -e "README.md" -e "Dockerfile" || circleci-agent step halt
+            git --no-pager diff --name-only | grep -q "README.md" || exit 0
+            git --no-pager diff --name-only | grep -q "Dockerfile" || exit 0
+            touch /tmp/doRelease
+          name: Exit if nothing changes
+      - add_ssh_keys:
+          fingerprints:
+            - "0c:de:e4:19:f5:d8:37:ac:5f:1f:a4:81:88:35:30:c1"
+      - run:
+          command: |
+            git config user.email "umihico@users.noreply.github.com"
+            git config user.name "umihico"
+          name: Configure git
+      - run:
+          command: |
+            set -euxo pipefail
+            BRANCH=$(date +%Y-%m-%d-%H%M%S)
+            TITLE="Version Updates $(date)"
+            git checkout -b $BRANCH
+            git add Dockerfile README.md
+            git commit -m "${TITLE}" -m "[skip ci]" -m "$(cat /tmp/VERSIONS)"
+            git push --set-upstream origin $BRANCH
+            gh pr create --body-file /tmp/VERSIONS --title "PR:${TITLE}"
+            gh pr merge --delete-branch --merge $BRANCH --body "[skip ci]"
+            [ -f /tmp/doRelease ] && gh release create $BRANCH --notes-file /tmp/VERSIONS --title "${TITLE}" || true
+          name: Release
+
+workflows:
+  version: 2
+  commit:
+    jobs:
+      - main:
+          context:
+            - public-circleci-aws
+  nightly:
+    triggers:
+      - schedule:
+          cron: "0 0 * * *"
+          filters:
+            branches:
+              only:
+                - circleci
+    jobs:
+      - main:
+          context:
+            - public-circleci-aws
